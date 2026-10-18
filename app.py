@@ -86,6 +86,37 @@ def fetch_candles(symbol, resolution):
 
     return payload.get("result", [])
 
+def calculate_trend(candles):
+    if not candles or len(candles) < 20:
+        return "INSUFFICIENT_DATA"
+
+    try:
+        candles = sorted(
+            candles,
+            key=lambda candle: candle["time"]
+        )
+
+        closes = [
+            float(candle["close"])
+            for candle in candles
+        ]
+
+        recent_closes = closes[-20:]
+        sma20 = sum(recent_closes) / len(recent_closes)
+        latest_close = closes[-1]
+
+        if latest_close > sma20:
+            return "BULLISH"
+        elif latest_close < sma20:
+            return "BEARISH"
+        else:
+            return "NEUTRAL"
+
+    except (KeyError, TypeError, ValueError):
+        return "INVALID_DATA"
+
+
+
 
 def screen_market(items, market, min_turnover):
     screened = []
