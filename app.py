@@ -1,12 +1,14 @@
 
-import requests
+import math
 from concurrent.futures import ThreadPoolExecutor
+
+import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
 DELTA_API = "https://api.india.delta.exchange"
-TIMEOUT = 10
+REQUEST_TIMEOUT = (3, 5)
 
 MIN_SPOT_TURNOVER_USD = 1000
 MIN_FUTURES_TURNOVER_USD = 50000
@@ -19,8 +21,15 @@ EXCLUDED_ASSETS = {
 
 def to_float(value):
     try:
-        number = float(value) if value is not None else None
-        return number if number is not None else None
+        if value is None:
+            return None
+
+        number = float(value)
+
+        if not math.isfinite(number):
+            return None
+
+        return number
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -46,25 +55,25 @@ def fetch_tickers(contract_type):
     response = requests.get(
         f"{DELTA_API}/v2/tickers",
         params={"contract_types": contract_type},
-        timeout=TIMEOUT
+        timeout=REQUEST_TIMEOUT
     )
 
     response.raise_for_status()
     payload = response.json()
 
     if not isinstance(payload, dict):
-        raise ValueError("Unexpected ticker API response")
+        raise ValueError("Unexpected Delta API response")
 
     if not payload.get("success"):
         raise ValueError(
-            f"Delta ticker API failed: {contract_type}"
+            f"Delta API returned unsuccessful response: {contract_type}"
         )
 
-    result = payload.get("result", [])
+    result = payload.get("result")
 
     if not isinstance(result, list):
         raise ValueError(
-            f"Invalid ticker data: {contract_type}"
+            f"Invalid ticker result for {contract_type}"
         )
 
     return result
@@ -91,30 +100,26 @@ def screen_market(items, market, min_turnover):
         symbol = item.get("symbol")
         asset = get_asset(item, market)
 
-        turnover = to_float(item.get("turnover_usd"))
-
-        price = to_float(item.get("spot_price"))
-
-        if price is None:
-            price = to_float(item.get("mark_price"))
-
-        if price is None:
-            price = to_float(item.get("close"))
-
-        change = to_float(item.get("ltp_change_24h"))
-        volume = to_float(item.get("volume"))
-
         if not symbol or not asset:
             continue
 
         if asset in EXCLUDED_ASSETS:
             continue
 
+        turnover = to_float(item.get("turnover_usd"))
         if turnover is None or turnover < min_turnover:
             continue
 
+        price = (
+            to_float(item.get("spot_price"))
+            or to_float(item.get("mark_price"))
+            or to_float(item.get("close"))
+        )
+
         if price is None or price <= 0:
             continue
+
+        change = to_float(item.get("ltp_change_24h"))
 
         if change is None:
             continue
@@ -135,7 +140,7 @@ def screen_market(items, market, min_turnover):
             "direction_24h": direction,
             "trend_1h": "NOT_CHECKED",
             "trend_4h": "NOT_CHECKED",
-            "volume": volume,
+            "volume": to_float(item.get("volume")),
             "turnover_usd": turnover,
             "open_interest": item.get("oi"),
             "funding_rate": (
@@ -178,22 +183,18 @@ def health():
 @app.route("/api/scanner")
 def scanner():
     try:
-        # Fetch Spot and Futures data concurrently.
+        # Request both markets concurrently.
         with ThreadPoolExecutor(max_workers=2) as executor:
-            spot_future = executor.submit(
-                fetch_tickers, "spot"
-            )
-            futures_future = executor.submit(
+            spot_job = executor.submit(fetch_tickers, "spot")
+            futures_job = executor.submit(
                 fetch_tickers, "perpetual_futures"
             )
 
-            spot_raw = spot_future.result()
-            futures_raw = futures_future.result()
+            spot_raw = spot_job.result()
+            futures_raw = futures_job.result()
 
         spot = screen_market(
-            spot_raw,
-            "spot",
-            MIN_SPOT_TURNOVER_USD
+            spot_raw, "spot", MIN_SPOT_TURNOVER_USD
         )
 
         futures = screen_market(
@@ -240,7 +241,7 @@ def scanner():
 
         return jsonify({
             "status": "error",
-            "message": "Unexpected internal scanner error"
+            "message": "Unexpected scanner error"
         }), 500
 
 
