@@ -173,6 +173,22 @@ def screen_market(items, market, min_turnover):
         else:
             direction = "NEUTRAL"
 
+        trend_1h = "NOT_CHECKED"
+        trend_4h = "NOT_CHECKED"
+
+        if market == "perpetual_futures":
+            try:
+                candles_1h = fetch_candles(symbol, "1h")
+                candles_4h = fetch_candles(symbol, "4h")
+
+                trend_1h = calculate_trend(candles_1h)
+                trend_4h = calculate_trend(candles_4h)
+
+            except (requests.RequestException, ValueError):
+                trend_1h = "DATA_ERROR"
+                trend_4h = "DATA_ERROR"
+
+
         screened.append({
             "market": market,
             "symbol": symbol,
