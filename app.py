@@ -80,6 +80,8 @@ def screen_market(items, market, min_turnover):
             price = to_float(item.get("close"))
 
         change = to_float(item.get("ltp_change_24h"))
+        if change is None:
+        continue
         volume = to_float(item.get("volume"))
 
         if not symbol or not asset:
