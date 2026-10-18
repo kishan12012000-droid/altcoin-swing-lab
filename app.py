@@ -7,11 +7,12 @@ app = Flask(__name__)
 DELTA_API = "https://api.india.delta.exchange"
 TIMEOUT = 15
 
-# Initial screening thresholds; review after observing real results.
+# Initial screening thresholds
 MIN_SPOT_TURNOVER_USD = 1000
 MIN_FUTURES_TURNOVER_USD = 50000
 MAX_RESULTS = 30
 
+# BTC, ETH aur stablecoins ko scanner se exclude karein
 EXCLUDED_ASSETS = {
     "BTC", "ETH", "XAUT", "USDT", "USDC", "DAI"
 }
@@ -26,6 +27,7 @@ def to_float(value):
 
 def get_asset(item, market):
     asset = item.get("underlying_asset_symbol")
+
     if asset:
         return asset.upper()
 
@@ -46,11 +48,14 @@ def fetch_tickers(contract_type):
         params={"contract_types": contract_type},
         timeout=TIMEOUT
     )
+
     response.raise_for_status()
     payload = response.json()
 
     if not payload.get("success"):
-        raise ValueError(f"Ticker request failed: {contract_type}")
+        raise ValueError(
+            f"Ticker request failed: {contract_type}"
+        )
 
     return payload.get("result", [])
 
@@ -66,32 +71,49 @@ def screen_market(items, market, min_turnover):
             item.get("product_trading_status")
             or item.get("trading_status")
         )
+
         if status != "operational":
             continue
 
         symbol = item.get("symbol")
         asset = get_asset(item, market)
+
         turnover = to_float(item.get("turnover_usd"))
         price = to_float(item.get("spot_price"))
 
         if price is None:
             price = to_float(item.get("mark_price"))
+
         if price is None:
             price = to_float(item.get("close"))
 
         change = to_float(item.get("ltp_change_24h"))
-        if change is None:
-        continue
         volume = to_float(item.get("volume"))
 
+        # Required data validation
         if not symbol or not asset:
             continue
+
         if asset in EXCLUDED_ASSETS:
             continue
+
         if turnover is None or turnover < min_turnover:
             continue
+
         if price is None or price <= 0:
             continue
+
+        # Skip markets without 24-hour change data
+        if change is None:
+            continue
+
+        # 24-hour direction label
+        if change > 0:
+            direction = "BULLISH"
+        elif change < 0:
+            direction = "BEARISH"
+        else:
+            direction = "NEUTRAL"
 
         screened.append({
             "market": market,
@@ -99,52 +121,63 @@ def screen_market(items, market, min_turnover):
             "asset": asset,
             "price": price,
             "change_24h_pct": change,
-            "direction_24h": (
-            "BULLISH" if change > 0
-       else "BEARISH" if change < 0
-    else "NEUTRAL"
-),
+            "direction_24h": direction,
             "volume": volume,
             "turnover_usd": turnover,
             "open_interest": item.get("oi"),
-            "funding_rate": item.get("funding_rate")
-                if market == "perpetual_futures" else None,
+            "funding_rate": (
+                item.get("funding_rate")
+                if market == "perpetual_futures"
+                else None
+            ),
             "trading_status": status
         })
 
+    # Highest turnover first
     screened.sort(
         key=lambda row: row["turnover_usd"],
         reverse=True
     )
 
-    for rank, row in enumerate(screened[:MAX_RESULTS], start=1):
+    results = screened[:MAX_RESULTS]
+
+    for rank, row in enumerate(results, start=1):
         row["liquidity_rank"] = rank
 
-    return screened[:MAX_RESULTS]
+    return results
 
 
 @app.route("/")
 def home():
     return jsonify({
         "project": "Altcoin Swing Lab",
-        "status": "running"
+        "status": "running",
+        "message": "Altcoin Swing Scanner API"
     })
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "healthy"})
+    return jsonify({
+        "status": "healthy"
+    })
 
 
 @app.route("/api/scanner")
 def scanner():
     try:
         spot_raw = fetch_tickers("spot")
-        futures_raw = fetch_tickers("perpetual_futures")
+
+        futures_raw = fetch_tickers(
+            "perpetual_futures"
+        )
 
         spot = screen_market(
-            spot_raw, "spot", MIN_SPOT_TURNOVER_USD
+            spot_raw,
+            "spot",
+            MIN_SPOT_TURNOVER_USD
         )
+
         futures = screen_market(
             futures_raw,
             "perpetual_futures",
@@ -154,19 +187,23 @@ def scanner():
         return jsonify({
             "status": "connected",
             "source": "Delta Exchange India",
+
             "screening": {
                 "excluded_assets": sorted(EXCLUDED_ASSETS),
-                "minimum_spot_turnover_usd": MIN_SPOT_TURNOVER_USD,
+                "minimum_spot_turnover_usd":
+                    MIN_SPOT_TURNOVER_USD,
                 "minimum_futures_turnover_usd":
                     MIN_FUTURES_TURNOVER_USD,
                 "ranking": "turnover_usd_descending",
                 "max_results_per_market": MAX_RESULTS
             },
+
             "markets": {
                 "spot": {
                     "count": len(spot),
                     "data": spot
                 },
+
                 "perpetual_futures": {
                     "count": len(futures),
                     "data": futures
@@ -174,7 +211,10 @@ def scanner():
             }
         })
 
-    except (requests.RequestException, ValueError) as error:
+    except (
+        requests.RequestException,
+        ValueError
+    ) as error:
         return jsonify({
             "status": "error",
             "message": "Market data request failed",
@@ -183,4 +223,7 @@ def scanner():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(
+        host="0.0.0.0",
+        port=10000
+    )
