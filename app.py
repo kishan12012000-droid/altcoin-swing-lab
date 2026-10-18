@@ -7,6 +7,38 @@ app = Flask(__name__)
 DELTA_API = "https://api.india.delta.exchange"
 TIMEOUT = 15
 
+# Initial screening thresholds; review after observing real results.
+MIN_SPOT_TURNOVER_USD = 1000
+MIN_FUTURES_TURNOVER_USD = 50000
+MAX_RESULTS = 30
+
+EXCLUDED_ASSETS = {
+    "BTC", "ETH", "XAUT", "USDT", "USDC", "DAI"
+}
+
+
+def to_float(value):
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_asset(item, market):
+    asset = item.get("underlying_asset_symbol")
+    if asset:
+        return asset.upper()
+
+    symbol = item.get("symbol", "").upper()
+
+    if market == "spot" and "_INR" in symbol:
+        return symbol.split("_INR")[0]
+
+    if market == "perpetual_futures" and symbol.endswith("USD"):
+        return symbol[:-3]
+
+    return ""
+
 
 def fetch_tickers(contract_type):
     response = requests.get(
@@ -15,28 +47,73 @@ def fetch_tickers(contract_type):
         timeout=TIMEOUT
     )
     response.raise_for_status()
-    data = response.json()
+    payload = response.json()
 
-    if not data.get("success"):
-        raise ValueError(f"Delta API failed for {contract_type}")
+    if not payload.get("success"):
+        raise ValueError(f"Ticker request failed: {contract_type}")
 
-    return data.get("result", [])
+    return payload.get("result", [])
 
 
-def normalize_ticker(item, market):
-    return {
-        "market": market,
-        "symbol": item.get("symbol"),
-        "underlying": item.get("underlying_asset_symbol"),
-        "price": item.get("spot_price") or item.get("close"),
-        "change_24h_pct": item.get("ltp_change_24h"),
-        "volume": item.get("volume"),
-        "turnover_usd": item.get("turnover_usd"),
-        "open_interest": item.get("oi"),
-        "funding_rate": item.get("funding_rate"),
-        "trading_status": item.get("product_trading_status")
+def screen_market(items, market, min_turnover):
+    screened = []
+
+    for item in items:
+        if item.get("contract_type") != market:
+            continue
+
+        status = (
+            item.get("product_trading_status")
             or item.get("trading_status")
-    }
+        )
+        if status != "operational":
+            continue
+
+        symbol = item.get("symbol")
+        asset = get_asset(item, market)
+        turnover = to_float(item.get("turnover_usd"))
+        price = to_float(item.get("spot_price"))
+
+        if price is None:
+            price = to_float(item.get("mark_price"))
+        if price is None:
+            price = to_float(item.get("close"))
+
+        change = to_float(item.get("ltp_change_24h"))
+        volume = to_float(item.get("volume"))
+
+        if not symbol or not asset:
+            continue
+        if asset in EXCLUDED_ASSETS:
+            continue
+        if turnover is None or turnover < min_turnover:
+            continue
+        if price is None or price <= 0:
+            continue
+
+        screened.append({
+            "market": market,
+            "symbol": symbol,
+            "asset": asset,
+            "price": price,
+            "change_24h_pct": change,
+            "volume": volume,
+            "turnover_usd": turnover,
+            "open_interest": item.get("oi"),
+            "funding_rate": item.get("funding_rate")
+                if market == "perpetual_futures" else None,
+            "trading_status": status
+        })
+
+    screened.sort(
+        key=lambda row: row["turnover_usd"],
+        reverse=True
+    )
+
+    for rank, row in enumerate(screened[:MAX_RESULTS], start=1):
+        row["liquidity_rank"] = rank
+
+    return screened[:MAX_RESULTS]
 
 
 @app.route("/")
@@ -55,38 +132,37 @@ def health():
 @app.route("/api/scanner")
 def scanner():
     try:
-        spot = fetch_tickers("spot")
-        futures = fetch_tickers("perpetual_futures")
+        spot_raw = fetch_tickers("spot")
+        futures_raw = fetch_tickers("perpetual_futures")
 
-        spot_rows = [
-            normalize_ticker(item, "spot")
-            for item in spot
-            if item.get("contract_type") == "spot"
-            and item.get("product_trading_status", item.get("trading_status"))
-                == "operational"
-            and item.get("symbol")
-        ]
-
-        futures_rows = [
-            normalize_ticker(item, "perpetual_futures")
-            for item in futures
-            if item.get("contract_type") == "perpetual_futures"
-            and item.get("product_trading_status", item.get("trading_status"))
-                == "operational"
-            and item.get("symbol")
-        ]
+        spot = screen_market(
+            spot_raw, "spot", MIN_SPOT_TURNOVER_USD
+        )
+        futures = screen_market(
+            futures_raw,
+            "perpetual_futures",
+            MIN_FUTURES_TURNOVER_USD
+        )
 
         return jsonify({
             "status": "connected",
             "source": "Delta Exchange India",
+            "screening": {
+                "excluded_assets": sorted(EXCLUDED_ASSETS),
+                "minimum_spot_turnover_usd": MIN_SPOT_TURNOVER_USD,
+                "minimum_futures_turnover_usd":
+                    MIN_FUTURES_TURNOVER_USD,
+                "ranking": "turnover_usd_descending",
+                "max_results_per_market": MAX_RESULTS
+            },
             "markets": {
                 "spot": {
-                    "count": len(spot_rows),
-                    "data": spot_rows
+                    "count": len(spot),
+                    "data": spot
                 },
                 "perpetual_futures": {
-                    "count": len(futures_rows),
-                    "data": futures_rows
+                    "count": len(futures),
+                    "data": futures
                 }
             }
         })
@@ -94,7 +170,7 @@ def scanner():
     except (requests.RequestException, ValueError) as error:
         return jsonify({
             "status": "error",
-            "message": "Could not fetch market data from Delta Exchange",
+            "message": "Market data request failed",
             "detail": str(error)
         }), 502
 
