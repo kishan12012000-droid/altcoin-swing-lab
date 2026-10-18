@@ -196,6 +196,8 @@ def screen_market(items, market, min_turnover):
             "price": price,
             "change_24h_pct": change,
             "direction_24h": direction,
+            "trend_1h": trend_1h,
+            "trend_4h": trend_4h,
             "volume": volume,
             "turnover_usd": turnover,
             "open_interest": item.get("oi"),
