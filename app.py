@@ -99,6 +99,11 @@ def screen_market(items, market, min_turnover):
             "asset": asset,
             "price": price,
             "change_24h_pct": change,
+            "direction_24h": (
+            "BULLISH" if change > 0
+       else "BEARISH" if change < 0
+    else "NEUTRAL"
+),
             "volume": volume,
             "turnover_usd": turnover,
             "open_interest": item.get("oi"),
