@@ -61,6 +61,32 @@ def fetch_tickers(contract_type):
     return payload.get("result", [])
 
 
+def fetch_candles(symbol, resolution):
+    end = int(time.time())
+    start = end - (7 * 24 * 60 * 60)
+
+    response = requests.get(
+        f"{DELTA_API}/v2/history/candles",
+        params={
+            "resolution": resolution,
+            "symbol": symbol,
+            "start": start,
+            "end": end
+        },
+        timeout=TIMEOUT
+    )
+
+    response.raise_for_status()
+    payload = response.json()
+
+    if not payload.get("success"):
+        raise ValueError(
+            f"Candle request failed: {symbol}, {resolution}"
+        )
+
+    return payload.get("result", [])
+
+
 def screen_market(items, market, min_turnover):
     screened = []
 
