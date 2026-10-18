@@ -1,19 +1,17 @@
 
 import requests
-import time
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
 DELTA_API = "https://api.india.delta.exchange"
-TIMEOUT = 15
+TIMEOUT = 10
 
-# Initial screening thresholds
 MIN_SPOT_TURNOVER_USD = 1000
 MIN_FUTURES_TURNOVER_USD = 50000
 MAX_RESULTS = 30
 
-# BTC, ETH aur stablecoins ko scanner se exclude karein
 EXCLUDED_ASSETS = {
     "BTC", "ETH", "XAUT", "USDT", "USDC", "DAI"
 }
@@ -21,8 +19,9 @@ EXCLUDED_ASSETS = {
 
 def to_float(value):
     try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
+        number = float(value) if value is not None else None
+        return number if number is not None else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -30,9 +29,9 @@ def get_asset(item, market):
     asset = item.get("underlying_asset_symbol")
 
     if asset:
-        return asset.upper()
+        return str(asset).upper()
 
-    symbol = item.get("symbol", "").upper()
+    symbol = str(item.get("symbol") or "").upper()
 
     if market == "spot" and "_INR" in symbol:
         return symbol.split("_INR")[0]
@@ -53,75 +52,31 @@ def fetch_tickers(contract_type):
     response.raise_for_status()
     payload = response.json()
 
-    if not payload.get("success"):
-        raise ValueError(
-            f"Ticker request failed: {contract_type}"
-        )
-
-    return payload.get("result", [])
-
-
-def fetch_candles(symbol, resolution):
-    end = int(time.time())
-    start = end - (7 * 24 * 60 * 60)
-
-    response = requests.get(
-        f"{DELTA_API}/v2/history/candles",
-        params={
-            "resolution": resolution,
-            "symbol": symbol,
-            "start": start,
-            "end": end
-        },
-        timeout=TIMEOUT
-    )
-
-    response.raise_for_status()
-    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected ticker API response")
 
     if not payload.get("success"):
         raise ValueError(
-            f"Candle request failed: {symbol}, {resolution}"
+            f"Delta ticker API failed: {contract_type}"
         )
 
-    return payload.get("result", [])
+    result = payload.get("result", [])
 
-def calculate_trend(candles):
-    if not candles or len(candles) < 20:
-        return "INSUFFICIENT_DATA"
-
-    try:
-        candles = sorted(
-            candles,
-            key=lambda candle: candle["time"]
+    if not isinstance(result, list):
+        raise ValueError(
+            f"Invalid ticker data: {contract_type}"
         )
 
-        closes = [
-            float(candle["close"])
-            for candle in candles
-        ]
-
-        recent_closes = closes[-20:]
-        sma20 = sum(recent_closes) / len(recent_closes)
-        latest_close = closes[-1]
-
-        if latest_close > sma20:
-            return "BULLISH"
-        elif latest_close < sma20:
-            return "BEARISH"
-        else:
-            return "NEUTRAL"
-
-    except (KeyError, TypeError, ValueError):
-        return "INVALID_DATA"
-
-
+    return result
 
 
 def screen_market(items, market, min_turnover):
     screened = []
 
     for item in items:
+        if not isinstance(item, dict):
+            continue
+
         if item.get("contract_type") != market:
             continue
 
@@ -137,6 +92,7 @@ def screen_market(items, market, min_turnover):
         asset = get_asset(item, market)
 
         turnover = to_float(item.get("turnover_usd"))
+
         price = to_float(item.get("spot_price"))
 
         if price is None:
@@ -148,7 +104,6 @@ def screen_market(items, market, min_turnover):
         change = to_float(item.get("ltp_change_24h"))
         volume = to_float(item.get("volume"))
 
-        # Required data validation
         if not symbol or not asset:
             continue
 
@@ -161,26 +116,15 @@ def screen_market(items, market, min_turnover):
         if price is None or price <= 0:
             continue
 
-        # Skip markets without 24-hour change data
         if change is None:
             continue
 
-        # 24-hour direction label
         if change > 0:
             direction = "BULLISH"
         elif change < 0:
             direction = "BEARISH"
         else:
             direction = "NEUTRAL"
-
-        trend_1h = "NOT_CHECKED"
-        trend_4h = "NOT_CHECKED"
-
-       
-        trend_1h = "NOT_CHECKED"
-        trend_4h = "NOT_CHECKED"
-
-
 
         screened.append({
             "market": market,
@@ -189,8 +133,8 @@ def screen_market(items, market, min_turnover):
             "price": price,
             "change_24h_pct": change,
             "direction_24h": direction,
-            "trend_1h": trend_1h,
-            "trend_4h": trend_4h,
+            "trend_1h": "NOT_CHECKED",
+            "trend_4h": "NOT_CHECKED",
             "volume": volume,
             "turnover_usd": turnover,
             "open_interest": item.get("oi"),
@@ -202,7 +146,6 @@ def screen_market(items, market, min_turnover):
             "trading_status": status
         })
 
-    # Highest turnover first
     screened.sort(
         key=lambda row: row["turnover_usd"],
         reverse=True
@@ -235,11 +178,17 @@ def health():
 @app.route("/api/scanner")
 def scanner():
     try:
-        spot_raw = fetch_tickers("spot")
+        # Fetch Spot and Futures data concurrently.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            spot_future = executor.submit(
+                fetch_tickers, "spot"
+            )
+            futures_future = executor.submit(
+                fetch_tickers, "perpetual_futures"
+            )
 
-        futures_raw = fetch_tickers(
-            "perpetual_futures"
-        )
+            spot_raw = spot_future.result()
+            futures_raw = futures_future.result()
 
         spot = screen_market(
             spot_raw,
@@ -256,7 +205,6 @@ def scanner():
         return jsonify({
             "status": "connected",
             "source": "Delta Exchange India",
-
             "screening": {
                 "excluded_assets": sorted(EXCLUDED_ASSETS),
                 "minimum_spot_turnover_usd":
@@ -266,13 +214,11 @@ def scanner():
                 "ranking": "turnover_usd_descending",
                 "max_results_per_market": MAX_RESULTS
             },
-
             "markets": {
                 "spot": {
                     "count": len(spot),
                     "data": spot
                 },
-
                 "perpetual_futures": {
                     "count": len(futures),
                     "data": futures
@@ -280,15 +226,22 @@ def scanner():
             }
         })
 
-    except (
-        requests.RequestException,
-        ValueError
-    ) as error:
+    except (requests.RequestException, ValueError) as error:
+        app.logger.exception("Scanner market-data request failed")
+
         return jsonify({
             "status": "error",
             "message": "Market data request failed",
             "detail": str(error)
         }), 502
+
+    except Exception:
+        app.logger.exception("Unexpected scanner error")
+
+        return jsonify({
+            "status": "error",
+            "message": "Unexpected internal scanner error"
+        }), 500
 
 
 if __name__ == "__main__":
