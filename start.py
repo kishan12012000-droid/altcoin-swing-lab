@@ -1,31 +1,20 @@
-
 import os
-from gunicorn.app.base import BaseApplication
-from app import app
+import sys
 
+port = os.environ.get("PORT", "10000")
 
-class StandaloneApplication(BaseApplication):
-    def __init__(self, application, options=None):
-        self.application = application
-        self.options = options or {}
-        super().__init__()
+command = [
+    sys.executable,
+    "-m",
+    "gunicorn",
+    "--bind", f"0.0.0.0:{port}",
+    "--workers", "1",
+    "--threads", "4",
+    "--timeout", "25",
+    "--graceful-timeout", "10",
+    "--access-logfile", "-",
+    "--error-logfile", "-",
+    "app:app"
+]
 
-    def load_config(self):
-        for key, value in self.options.items():
-            if key in self.cfg.settings and value is not None:
-                self.cfg.set(key, value)
-
-    def load(self):
-        return self.application
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-
-    StandaloneApplication(
-        app,
-        {
-            "bind": f"0.0.0.0:{port}",
-            "workers": 1
-        }
-    ).run()
+os.execv(sys.executable, command)
